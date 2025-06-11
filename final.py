@@ -1,182 +1,182 @@
 import xml.etree.ElementTree as ET
-import csv
-import os
-import mysql.connector
+import csv, os, json, mysql.connector
 
-XML_FOLDER = r"C:\Users\madhu\OneDrive\Desktop\Karthik\litmus\Crap"
-EXCLUDED_ATTRIBUTES_FILE = "excluded_attributes.csv"
-INPUT_CSV_CASE1 = "input.csv"
-ORDER_PAIR_CSV = "orders_to_compare.csv"
-DB_CONFIG = dict(host="localhost", user="root", password="KONOHA777", database="xml6")
+XML_FOLDER            = r"C:\Users\user\Desktop\xmls_files1"
+EXCLUDED_ATTRIBUTES   = "excluded_attributes.csv"
+INPUT_CSV_CASE1       = "input.csv"                 
+ORDER_PAIR_CSV        = "orders_to_compare.csv"     
+INPUT_CSV_JSON        = "input_json.csv"            
+ORDER_PAIR_JSON       = "orders_to_compare_json.csv"
+DB_CONFIG = dict(
+    host     = "localhost",
+    user     = "root",
+    password = "KONOHA777",
+    database = "json_db"          
+)
 DEBUG = False
 
-def strip_ns(tag):
-    return tag.split('}', 1)[-1] if '}' in tag else tag
 
-TAG_MAPPING = {}
-ATTR_MAPPING = {}
-IGNORE_TAGS = {
-    "ApplicationArea", "Process", "ActionCriteria", "ActionExpression",
-}
+def strip_ns(tag): return tag.split('}', 1)[-1] if '}' in tag else tag
 
-def canonical_tag(local): return TAG_MAPPING.get(local, local)
-def canonical_attr(local): return ATTR_MAPPING.get(local, local)
+TAG_MAPPING, ATTR_MAPPING = {}, {}
+IGNORE_TAGS = {"ApplicationArea", "Process", "ActionCriteria", "ActionExpression"}
 
-def flatten_elements(root: ET.Element) -> dict:
+def canonical_tag(t):  return TAG_MAPPING.get(t,  t)
+def canonical_attr(a): return ATTR_MAPPING.get(a, a)
+
+def flatten_elements(root: ET.Element):
     elements = {}
+    def rec(e, path="", sib=None):
+        sib = sib or {}
+        local = canonical_tag(strip_ns(e.tag))
+        if local in IGNORE_TAGS: return
 
-    def recurse(elem: ET.Element, path="", sib_counter=None):
-        if sib_counter is None:
-            sib_counter = {}
+        attribs = {canonical_attr(strip_ns(k)): v for k, v in e.attrib.items()}
+        name = attribs.get("name")
 
-        local = strip_ns(elem.tag)
-        canon = canonical_tag(local)
-        if canon in IGNORE_TAGS:
-            return
-
-        attribs = {canonical_attr(strip_ns(k)): v for k, v in elem.attrib.items()}
-        name_attr = attribs.get("name")
-
-        if canon in {"ProtocolData", "UserDataField"} and name_attr:
-            new_path = f"{path}/{canon}[@name='{name_attr}']"
+        if local in {"ProtocolData", "UserDataField"} and name:
+            new_path = f"{path}/{local}[@name='{name}']"
         else:
-            idx = sib_counter.get(canon, 0) + 1
-            sib_counter[canon] = idx
-            new_path = f"{path}/{canon}[{idx}]" if path else f"/{canon}[{idx}]"
+            idx = sib.get(local, 0) + 1
+            sib[local] = idx
+            new_path = f"{path}/{local}[{idx}]" if path else f"/{local}[{idx}]"
 
-        elements[new_path] = {
-            "attrib": attribs,
-            "text": (elem.text or "").strip()
-        }
-
+        elements[new_path] = {"attrib": attribs, "text": (e.text or "").strip()}
         child_counts = {}
-        for child in elem:
-            recurse(child, new_path, child_counts)
-
-    recurse(root)
-    if DEBUG:
-        print("Flattened elements:", list(elements.items())[:5])
+        for c in e: rec(c, new_path, child_counts)
+    rec(root)
+    if DEBUG: print(">> Flattened paths:", len(elements))
     return elements
 
-def load_excluded_attributes(csv_path=EXCLUDED_ATTRIBUTES_FILE):
-    excluded = set()
-    try:
-        with open(csv_path, newline="", encoding="utf-8") as f:
-            rdr = csv.DictReader(f)
-            for row in rdr:
-                if 'attribute' in row and row['attribute'].strip():
-                    excluded.add(canonical_attr(row['attribute'].strip()))
-    except FileNotFoundError:
-        print(f"  Attribute-exclusion file not found: {csv_path}")
-    return excluded
+def flatten_json(obj, path=""):
+    out = {}
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            out.update(flatten_json(v, f"{path}.{k}" if path else k))
+    elif isinstance(obj, list):
+        for i, v in enumerate(obj):
+            out.update(flatten_json(v, f"{path}[{i}]"))
+    else:
+        out[path] = str(obj)
+    return out
 
-def compare_dicts(wcs_dict: dict, micro_dict: dict, excluded_attrs: set):
+def compare_json(a, b):
+    fa, fb = flatten_json(a), flatten_json(b)
     diffs = []
-
-    for path, g in wcs_dict.items():
-        if path not in micro_dict:
-            name_hint = g["attrib"].get("name", path.split("/")[-1])
-            diffs.append((name_hint, "Tag missing", g["text"], "-"))
-            continue
-
-        m = micro_dict[path]
-        for attr, wcs_val in g["attrib"].items():
-            if attr in excluded_attrs:
-                continue
-            mic_val = m["attrib"].get(attr)
-            if mic_val is None:
-                diffs.append((attr, "Attribute missing", wcs_val, "-"))
-            elif mic_val != wcs_val:
-                diffs.append((attr, "Attribute mismatch", wcs_val, mic_val))
-        if g["text"] != m["text"]:
-            diffs.append(("(text)", "Text mismatch", g["text"], m["text"]))
-
-    for path in micro_dict:
-        if path not in wcs_dict:
-            g = micro_dict[path]
-            name_hint = g["attrib"].get("name", path.split("/")[-1])
-            diffs.append((name_hint, "Extra tag", "-", g["text"]))
-
+    for k in sorted(set(fa)|set(fb)):
+        v1, v2 = fa.get(k, "-"), fb.get(k, "-")
+        if v1 != v2:
+            diffs.append((k,
+                          "Value mismatch" if k in fa and k in fb else "Missing key",
+                          v1, v2))
     return diffs
 
-def process_case1(input_csv, output_csv):
-    excluded = load_excluded_attributes()
-    all_diffs = []
+def load_excluded(csv_path=EXCLUDED_ATTRIBUTES):
+    try:
+        with open(csv_path, newline="", encoding="utf-8") as f:
+            return {canonical_attr(r['attribute'].strip())
+                    for r in csv.DictReader(f) if r['attribute'].strip()}
+    except FileNotFoundError:
+        print("! Attribute exclusion file not found – continuing without.")
+        return set()
 
-    with open(input_csv, newline="", encoding="utf-8") as f:
-        rdr = csv.DictReader(f)
-        if {"wcs_xml", "micro_xml"} - set(rdr.fieldnames):
-            raise ValueError("CSV must have 'wcs_xml' and 'micro_xml' columns.")
-        for row in rdr:
-            wcs_path = os.path.join(XML_FOLDER, row["wcs_xml"])
-            mic_path = os.path.join(XML_FOLDER, row["micro_xml"])
-            print(f"\n Comparing {row['wcs_xml']} ↔ {row['micro_xml']}")
-
-            try:
-                wcs_root = ET.parse(wcs_path).getroot()
-                mic_root = ET.parse(mic_path).getroot()
-            except ET.ParseError as e:
-                print(" XML parse error:", e)
-                continue
-
-            wcs_dict = flatten_elements(wcs_root)
-            mic_dict = flatten_elements(mic_root)
-            all_diffs.extend(compare_dicts(wcs_dict, mic_dict, excluded))
-
-    write_csv(all_diffs, output_csv)
-
-def fetch_xml_by_id(conn, order_id):
-    cur = conn.cursor()
-    cur.execute("SELECT xml_content FROM orders WHERE order_id=%s", (order_id,))
-    row = cur.fetchone()
-    return row[0] if row else None
-
-def process_case2(output_csv):
-    excluded = load_excluded_attributes()
-    conn = mysql.connector.connect(**DB_CONFIG)
-
-    with open(ORDER_PAIR_CSV, newline="") as f:
-        rdr = csv.DictReader(f)
-        pairs = [(r["wcs_order_id"], r["micro_order_id"]) for r in rdr]
-
-    all_diffs = []
-    for wcs_id, mic_id in pairs:
-        print(f"\n Comparing DB order {wcs_id} ↔ {mic_id}")
-        wcs_xml = fetch_xml_by_id(conn, wcs_id)
-        mic_xml = fetch_xml_by_id(conn, mic_id)
-        if not wcs_xml or not mic_xml:
-            print(" Missing XML for pair; skipping")
+def compare_xml_dicts(wcs, mic, excl):
+    diffs = []
+    for p,g in wcs.items():
+        if p not in mic:
+            diffs.append((g["attrib"].get("name", p.split("/")[-1]),"Tag missing",g["text"],"-"))
             continue
-        try:
-            wcs_root = ET.fromstring(wcs_xml)
-            mic_root = ET.fromstring(mic_xml)
-        except ET.ParseError as e:
-            print("Parse error:", e)
-            continue
+        m = mic[p]
+        for attr, wv in g["attrib"].items():
+            if attr in excl: continue
+            mv = m["attrib"].get(attr)
+            if mv is None:        diffs.append((attr,"Attribute missing",wv,"-"))
+            elif mv != wv:        diffs.append((attr,"Attribute mismatch",wv,mv))
+        if g["text"] != m["text"]:
+            diffs.append(("(text)","Text mismatch",g["text"],m["text"]))
+    for p in mic:
+        if p not in wcs:
+            g = mic[p]
+            diffs.append((g["attrib"].get("name", p.split("/")[-1]),"Extra tag","-",g["text"]))
+    return diffs
 
-        wcs_dict = flatten_elements(wcs_root)
-        mic_dict = flatten_elements(mic_root)
-        all_diffs.extend(compare_dicts(wcs_dict, mic_dict, excluded))
-
-    conn.close()
-    write_csv(all_diffs, output_csv)
-
-def write_csv(rows, out_path):
-    with open(out_path, "w", newline="", encoding="utf-8") as f:
+def write_csv(rows, path):
+    with open(path,"w",newline="",encoding="utf-8") as f:
         w = csv.writer(f)
-        w.writerow(["attribute", "difference type", "wcs value", "microservice value"])
+        w.writerow(["attribute","difference type","wcs value","microservice value"])
         w.writerows(rows)
-    print(f"\n {len(rows)} difference rows written ➜ {out_path}")
+    print(f"\n✔ {len(rows)} difference rows written → {path}")
+
+
+def process_case1(inp=INPUT_CSV_CASE1, out="all_differences_case1.csv"):
+    excl = load_excluded(); diffs=[]
+    for r in csv.DictReader(open(inp,encoding="utf-8")):
+        wp, mp = (os.path.join(XML_FOLDER, r["wcs_xml"]),
+                  os.path.join(XML_FOLDER, r["micro_xml"]))
+        print(f"\n• FS-XML  {r['wcs_xml']} ↔ {r['micro_xml']}")
+        try:
+            wd, md = map(flatten_elements,
+                         (ET.parse(wp).getroot(), ET.parse(mp).getroot()))
+            diffs += compare_xml_dicts(wd, md, excl)
+        except ET.ParseError as e: print("  XML parse error:",e)
+    write_csv(diffs, out)
+
+def fetch_xml(conn, oid):
+    cur=conn.cursor(); cur.execute("SELECT xml_content FROM orders WHERE order_id=%s",(oid,))
+    r=cur.fetchone(); return r and r[0]
+
+def fetch_json(conn, oid):
+    cur=conn.cursor(); cur.execute("SELECT json_content FROM orders WHERE order_id=%s",(oid,))
+    r=cur.fetchone();  return r and r[0]       
+
+def process_case2(out="all_differences_case2.csv", pair_csv=ORDER_PAIR_CSV):
+    conn=mysql.connector.connect(**DB_CONFIG)
+    excl=load_excluded(); diffs=[]
+    for wcs_id,mic_id in [(r["wcs_order_id"],r["micro_order_id"])
+                          for r in csv.DictReader(open(pair_csv,encoding="utf-8"))]:
+        print(f"\n• DB-XML  {wcs_id} ↔ {mic_id}")
+        wx, mx = fetch_xml(conn,wcs_id), fetch_xml(conn,mic_id)
+        if not wx or not mx: print("  missing XML – skipped"); continue
+        diffs += compare_xml_dicts(flatten_elements(ET.fromstring(wx)),
+                                   flatten_elements(ET.fromstring(mx)), excl)
+    conn.close(); write_csv(diffs,out)
+
+def process_case3(inp=INPUT_CSV_JSON, out="all_differences_case3.csv"):
+    diffs=[]
+    for r in csv.DictReader(open(inp,encoding="utf-8")):
+        wp, mp = (os.path.join(XML_FOLDER, r["wcs_json"]),
+                  os.path.join(XML_FOLDER, r["micro_json"]))
+        print(f"\n• FS-JSON {r['wcs_json']} ↔ {r['micro_json']}")
+        try:
+            j1, j2 = json.load(open(wp,"r",encoding="utf-8")), \
+                     json.load(open(mp,"r",encoding="utf-8"))
+            diffs += compare_json(j1,j2)
+        except Exception as e: print("  JSON error:",e)
+    write_csv(diffs,out)
+
+def process_case4(out="all_differences_case4.csv", pair_csv=ORDER_PAIR_JSON):
+    conn=mysql.connector.connect(**DB_CONFIG); diffs=[]
+    for wcs_id,mic_id in [(r["wcs_order_id"],r["micro_order_id"])
+                          for r in csv.DictReader(open(pair_csv,encoding="utf-8"))]:
+        print(f"\n• DB-JSON {wcs_id} ↔ {mic_id}")
+        j1, j2 = fetch_json(conn,wcs_id), fetch_json(conn,mic_id)
+        if not j1 or not j2: print("  missing JSON – skipped"); continue
+        try:
+            if isinstance(j1,str): j1=json.loads(j1)
+            if isinstance(j2,str): j2=json.loads(j2)
+        except json.JSONDecodeError as e:
+            print("  decode error:",e); continue
+        diffs += compare_json(j1,j2)
+    conn.close(); write_csv(diffs,out)
 
 def main():
-    print("Select comparison mode:\n 1 – File compare\n 2 – DB compare")
-    choice = input("Enter 1 or 2: ").strip()
-    if choice == "1":
-        process_case1(INPUT_CSV_CASE1, "all_differences_case1.csv")
-    elif choice == "2":
-        process_case2("all_differences_case2.csv")
-    else:
-        print("Bye!")
+    src = input("Select source  (1-File  2-DB)  : ").strip()
+    fmt = input("Select format (1-XML   2-JSON): ").strip()
+    if (src,fmt)==("1","1"): process_case1()
+    elif (src,fmt)==("2","1"): process_case2()
+    elif (src,fmt)==("1","2"): process_case3()
+    elif (src,fmt)==("2","2"): process_case4()
+    else: print("Invalid choice.")
 
 if __name__ == "__main__":
     main()
