@@ -96,14 +96,37 @@ def flatten_json(obj, path=""):
         items[path] = str(obj)
     return items
 
-def compare_json_files(json1, json2):
-    """Compare two JSON objects returning list of differences"""
+def compare_json_files(json1, json2, excluded_attrs=None):
+    """Compare two JSON objects returning list of differences, respecting excluded attributes"""
+    if excluded_attrs is None:
+        excluded_attrs = set()
+
     flat1 = flatten_json(json1)
     flat2 = flatten_json(json2)
     diffs = []
 
     keys = set(flat1.keys()).union(set(flat2.keys()))
     for key in keys:
+        # Check if this key should be excluded
+        should_exclude = False
+        
+        # Check for exact match first
+        if key in excluded_attrs:
+            should_exclude = True
+        else:
+            # Check for pattern matches by normalizing array notation
+            normalized_key = key
+            # Convert Items[1].ProductID to Items.ProductID for comparison
+            import re
+            normalized_key = re.sub(r'\[\d+\]', '', key)
+            
+            if normalized_key in excluded_attrs:
+                should_exclude = True
+        
+        if should_exclude:
+            if DEBUG:
+                print(f"Excluding JSON key '{key}' from comparison")
+            continue
         val1 = flat1.get(key, "-")
         val2 = flat2.get(key, "-")
         if val1 != val2:
@@ -266,7 +289,7 @@ def process_case2(output_csv):
 
     all_diffs = []
     for wcs_id, mic_id in pairs:
-        print(f"\n🔍 Comparing DB order {wcs_id} ↔ {mic_id}")
+        print(f"\n Comparing DB order {wcs_id} ↔ {mic_id}")
         wcs_xml = fetch_xml_by_id(conn_xml, wcs_id)
         mic_xml = fetch_xml_by_id(conn_xml, mic_id)
         if not wcs_xml or not mic_xml:
@@ -292,6 +315,7 @@ def process_case3(input_csv, output_csv):
     CSV columns must include 'wcs_json' and 'micro_json' with file names including extensions
     """
     all_diffs = []
+    excluded = load_excluded_attributes()
 
     with open(input_csv, newline="", encoding="utf-8") as f:
         rdr = csv.DictReader(f)
@@ -301,7 +325,7 @@ def process_case3(input_csv, output_csv):
         for row in rdr:
             wcs_path = os.path.join(XML_FOLDER, row["wcs_json"])
             mic_path = os.path.join(XML_FOLDER, row["micro_json"])
-            print(f"\n🔍 Comparing {row['wcs_json']} ↔ {row['micro_json']}")
+            print(f"\n Comparing {row['wcs_json']} ↔ {row['micro_json']}")
 
             try:
                 with open(wcs_path, "r", encoding="utf-8") as f1, open(mic_path, "r", encoding="utf-8") as f2:
@@ -310,9 +334,7 @@ def process_case3(input_csv, output_csv):
             except Exception as e:
                 print(" JSON parse error:", e)
                 continue
-
-            all_diffs.extend(compare_json_files(json1, json2))
-
+            all_diffs.extend(compare_json_files(json1, json2, excluded))
     write_csv(all_diffs, output_csv)
 
 def process_case4(out="all_differences_case4.csv", pair_csv=ORDER_PAIR_JSON):
@@ -320,6 +342,7 @@ def process_case4(out="all_differences_case4.csv", pair_csv=ORDER_PAIR_JSON):
     Case 4: Compare JSON content from DB for pairs specified in orders_to_compare_json.csv
     CSV columns: wcs_order_id, micro_order_id
     """
+    excluded = load_excluded_attributes()
     conn_json = mysql.connector.connect(**DB_CONFIG_JSON)
     diffs = []
     with open(pair_csv, encoding="utf-8") as f:
@@ -330,7 +353,7 @@ def process_case4(out="all_differences_case4.csv", pair_csv=ORDER_PAIR_JSON):
         pairs = [(r["wcs_order_id"], r["micro_order_id"]) for r in rdr]
 
     for wcs_id, mic_id in pairs:
-        print(f"\n🔍 DB-JSON {wcs_id} ↔ {mic_id}")
+        print(f"\n DB-JSON {wcs_id} ↔ {mic_id}")
         j1 = fetch_json(conn_json, wcs_id)
         j2 = fetch_json(conn_json, mic_id)
         if not j1 or not j2:
@@ -343,9 +366,9 @@ def process_case4(out="all_differences_case4.csv", pair_csv=ORDER_PAIR_JSON):
             if isinstance(j2, str):
                 j2 = json.loads(j2)
         except json.JSONDecodeError as e:
-            print("🛑 decode error:", e)
+            print(" decode error:", e)
             continue
-        diffs += compare_json_files(j1, j2)
+        diffs += compare_json_files(j1, j2, excluded)
     conn_json.close()
     write_csv(diffs, out)
 
@@ -355,7 +378,7 @@ def write_csv(rows, out_path):
         w = csv.writer(f)
         w.writerow(["attribute", "difference type", "wcs value", "microservice value"])
         w.writerows(rows)
-    print(f"\n✅ {len(rows)} difference rows written ➜ {out_path}")
+    print(f"\n {len(rows)} difference rows written ➜ {out_path}")
 
 def main():
     print("Select source:\n 1 – File System\n 2 – Database")
